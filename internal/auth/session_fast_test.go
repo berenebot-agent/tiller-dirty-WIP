@@ -1,71 +1,36 @@
-package auth
+package auth_test
 
 import (
 	"context"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
+	"github.com/tiller-router/tiller-router/internal/auth"
 	"github.com/tiller-router/tiller-router/internal/database"
+	"github.com/tiller-router/tiller-router/internal/testutil/fastsecret"
 )
 
-func newTestStore(t *testing.T, username, password string, ttl time.Duration) (*SessionStore, *database.DB) {
+// newFastStore creates a SessionStore using the fast test hasher. These tests
+// verify session creation/persistence/expiry/CSRF/invalidation semantics, which
+// do not require the 64 MiB Argon2id cost; TestSessionStoreProductionHasher in
+// session_test.go covers the real KDF path.
+func newFastStore(t *testing.T, username, password string, ttl time.Duration) (*auth.SessionStore, *database.DB) {
 	t.Helper()
 	db, err := database.Open(context.Background(), filepath.Join(t.TempDir(), "router.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Close() })
-	store, err := NewSessionStore(db.SQL, username, password, ttl)
+	store, err := auth.NewSessionStoreWithHasher(db.SQL, username, password, ttl, fastsecret.Hasher{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return store, db
 }
 
-// TestSessionStoreProductionHasher verifies the production Argon2id path: hashes
-// use the argon2id PHC prefix, parameters are 64MiB/3/4, correct/incorrect
-// secrets verify/fail, malformed PHC fails, and material is not stored
-// plaintext.
-func TestSessionStoreProductionHasher(t *testing.T) {
-	store, db := newTestStore(t, "admin", "pw", 30*24*time.Hour)
-	_ = db
-	session, err := store.Create()
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, secret, _ := parseSessionToken(session.Token)
-	var tokenHash string
-	if err := store.db.QueryRow(`SELECT token_hash FROM admin_sessions`).Scan(&tokenHash); err != nil {
-		t.Fatal(err)
-	}
-	if !strings.HasPrefix(tokenHash, "$argon2id$") {
-		t.Fatalf("expected argon2id hash, got %q", tokenHash)
-	}
-	memory, iterations, lanes, err := ArgonParameters(tokenHash)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if memory != 64*1024 || iterations != 3 || lanes != 4 {
-		t.Fatalf("unexpected Argon2id parameters: %d/%d/%d", memory, iterations, lanes)
-	}
-	if !store.hasher.Verify(secret, tokenHash) {
-		t.Fatal("correct secret did not verify against production hash")
-	}
-	if store.hasher.Verify(secret+"wrong", tokenHash) {
-		t.Fatal("incorrect secret verified against production hash")
-	}
-	if store.hasher.Verify(secret, "$malformed$hash") {
-		t.Fatal("malformed PHC verified")
-	}
-	if tokenHash == secret {
-		t.Fatal("raw session secret stored in database")
-	}
-}
-
-func TestSessionCreateGetDelete(t *testing.T) {
-	store, _ := newTestStore(t, "admin", "pw", 30*24*time.Hour)
+func TestFastSessionCreateGetDelete(t *testing.T) {
+	store, _ := newFastStore(t, "admin", "pw", 30*24*time.Hour)
 	session, err := store.Create()
 	if err != nil {
 		t.Fatal(err)
@@ -92,13 +57,13 @@ func TestSessionCreateGetDelete(t *testing.T) {
 	}
 }
 
-func TestSessionSurvivesRestart(t *testing.T) {
+func TestFastSessionSurvivesRestart(t *testing.T) {
 	dir := t.TempDir()
 	db, err := database.Open(context.Background(), filepath.Join(dir, "router.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	store, err := NewSessionStore(db.SQL, "admin", "pw", 30*24*time.Hour)
+	store, err := auth.NewSessionStoreWithHasher(db.SQL, "admin", "pw", 30*24*time.Hour, fastsecret.Hasher{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,13 +73,12 @@ func TestSessionSurvivesRestart(t *testing.T) {
 	}
 	db.Close()
 
-	// Reopen the same DB file and build a fresh store, simulating a restart.
 	db2, err := database.Open(context.Background(), filepath.Join(dir, "router.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db2.Close()
-	store2, err := NewSessionStore(db2.SQL, "admin", "pw", 30*24*time.Hour)
+	store2, err := auth.NewSessionStoreWithHasher(db2.SQL, "admin", "pw", 30*24*time.Hour, fastsecret.Hasher{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,16 +91,15 @@ func TestSessionSurvivesRestart(t *testing.T) {
 	}
 }
 
-func TestSessionSlidingExpiry(t *testing.T) {
-	store, db := newTestStore(t, "admin", "pw", time.Hour)
+func TestFastSessionSlidingExpiry(t *testing.T) {
+	store, db := newFastStore(t, "admin", "pw", time.Hour)
 	session, err := store.Create()
 	if err != nil {
 		t.Fatal(err)
 	}
-	selector, _, _ := parseSessionToken(session.Token)
-	// Force the expiry to just past the half-lifetime threshold (ttl/2 = 30m),
-	// so the next Get extends it.
+	selector, _, _ := auth.ParseSessionToken(session.Token)
 	half := time.Now().Add(29 * time.Minute)
+
 	if _, err := db.SQL.Exec(`UPDATE admin_sessions SET expires_at=? WHERE id=?`, half.UTC().Format(time.RFC3339Nano), selector); err != nil {
 		t.Fatal(err)
 	}
@@ -149,14 +112,15 @@ func TestSessionSlidingExpiry(t *testing.T) {
 	}
 }
 
-func TestSessionExpiredRejected(t *testing.T) {
-	store, db := newTestStore(t, "admin", "pw", time.Hour)
+func TestFastSessionExpiredRejected(t *testing.T) {
+	store, db := newFastStore(t, "admin", "pw", time.Hour)
 	session, err := store.Create()
 	if err != nil {
 		t.Fatal(err)
 	}
-	selector, _, _ := parseSessionToken(session.Token)
+	selector, _, _ := auth.ParseSessionToken(session.Token)
 	if _, err := db.SQL.Exec(`UPDATE admin_sessions SET expires_at=? WHERE id=?`, time.Now().Add(-time.Minute).UTC().Format(time.RFC3339Nano), selector); err != nil {
+
 		t.Fatal(err)
 	}
 	if _, ok := store.Get(session.Token); ok {
@@ -164,14 +128,14 @@ func TestSessionExpiredRejected(t *testing.T) {
 	}
 }
 
-func TestCredentialChangeInvalidatesSessions(t *testing.T) {
+func TestFastCredentialChangeInvalidatesSessions(t *testing.T) {
 	dir := t.TempDir()
 	db, err := database.Open(context.Background(), filepath.Join(dir, "router.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	store, err := NewSessionStore(db.SQL, "admin", "oldpw", 30*24*time.Hour)
+	store, err := auth.NewSessionStoreWithHasher(db.SQL, "admin", "oldpw", 30*24*time.Hour, fastsecret.Hasher{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,8 +143,7 @@ func TestCredentialChangeInvalidatesSessions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Simulate a restart with changed credentials.
-	store2, err := NewSessionStore(db.SQL, "admin", "newpw", 30*24*time.Hour)
+	store2, err := auth.NewSessionStoreWithHasher(db.SQL, "admin", "newpw", 30*24*time.Hour, fastsecret.Hasher{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,8 +152,8 @@ func TestCredentialChangeInvalidatesSessions(t *testing.T) {
 	}
 }
 
-func TestMultipleSessionsCoexist(t *testing.T) {
-	store, _ := newTestStore(t, "admin", "pw", 30*24*time.Hour)
+func TestFastMultipleSessionsCoexist(t *testing.T) {
+	store, _ := newFastStore(t, "admin", "pw", 30*24*time.Hour)
 	s1, err := store.Create()
 	if err != nil {
 		t.Fatal(err)
@@ -214,13 +177,13 @@ func TestMultipleSessionsCoexist(t *testing.T) {
 	}
 }
 
-func TestSessionSecretNotStoredInPlaintext(t *testing.T) {
-	store, db := newTestStore(t, "admin", "pw", 30*24*time.Hour)
+func TestFastSessionSecretNotStoredInPlaintext(t *testing.T) {
+	store, db := newFastStore(t, "admin", "pw", 30*24*time.Hour)
 	session, err := store.Create()
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, secret, _ := parseSessionToken(session.Token)
+	_, secret, _ := auth.ParseSessionToken(session.Token)
 	var tokenHash string
 	if err := db.SQL.QueryRow(`SELECT token_hash FROM admin_sessions`).Scan(&tokenHash); err != nil {
 		t.Fatal(err)
@@ -228,14 +191,15 @@ func TestSessionSecretNotStoredInPlaintext(t *testing.T) {
 	if tokenHash == secret {
 		t.Fatal("raw session secret stored in database")
 	}
-	// Use the store's hasher (fast in tests) to verify the stored hash.
-	if !store.hasher.Verify(secret, tokenHash) {
+	// The stored hash must verify against the secret via the store's Get,
+	// which exercises the fast hasher's Verify path.
+	if _, ok := store.Get(session.Token); !ok {
 		t.Fatal("stored hash does not verify against the session secret")
 	}
 }
 
-func TestInvalidTokenRejected(t *testing.T) {
-	store, _ := newTestStore(t, "admin", "pw", 30*24*time.Hour)
+func TestFastInvalidTokenRejected(t *testing.T) {
+	store, _ := newFastStore(t, "admin", "pw", 30*24*time.Hour)
 	if _, ok := store.Get(""); ok {
 		t.Fatal("empty token accepted")
 	}
